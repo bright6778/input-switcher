@@ -1,55 +1,51 @@
 # Logitech MX - Input Switcher
 
 # 1 - Introduction
-The application and scripts provided in this repository let you switch your Logitech keyboard and mouse with one click of a button to another channel. This respository contains scritps for both Windows and Linux. You can use this repository to create your own specific setup.
-The repository contains the hidapitester tool for both Windows and Linux.
-If you prefer to use the most current version you can download this here: https://github.com/todbot/hidapitester
+The scripts provided in this repository let you switch your Logitech keyboard and mouse with one click of a button to another channel. This repository contains scripts as well as the hidapitester tool for both Windows and Linux.
+If you prefer the most current version of the hidapitester you can download this here: https://github.com/todbot/hidapitester.
 
-What you need is 2 Logitech Unifying/Bolt receivers or bluetooth connection. One for your Windows machine and one for your Linux machine. 
-Then take one receiver and first connect the keyboard to it and then the mouse. Make sure that both are connected on channel 1.
-Take the second receiver and first connect the keyborad to it and then the mouse. Make sure that both are connected on channel 2.
-The first receiver connects to the Windows machine, the second to the Linux machine.
+What you need are multiple Logitech devices with Easy-Switch (typically a keyboard and a mouse), that are connected to two different machines either directly via bluetooth or via Logitech Unifying or Bolt receivers. All devices should connect to the machine A when set to channel 1 and to machine B when set to channel 2.
 
-So if your keyboard and mouse are on channel 1, they control the Windows machine. If they are on channel 2, they control the Linux machine.
+Then, on machine A we will set up a script that causes all devices to switch to channel 2 and bind this script to a key. On machine B, we set up a script that causes all devices to switch to channel 1 and bind this to the same key. As a result, by pressing this key your devices will switch back and forth between machines.
+
+This tutorial assumes machine A is Windows and machine B is Linux. Of course, other setups are also possible. Just make sure to modify the names and target channel of the scripts accordingly.
 
 # 2 - Windows
 The **windows** folder contains the following files:
-- switch_to_2.bat
-- switch_to_2.vbs
-- hidapitester.exe
+- `switch_to_2.bat` ... This simple batch script switches your devices to channel 2.
+- `switch_to_2.vbs` ... This is a Visual Basic script that is just a wrapper around switch_to_2.bat. If you would execute switch_to_2.bat you would get a command prompt window that pops up every time. The switch_to_2.vbs script prevents this. So if you bind this script to a key on your keyboard you can switch to another channel without the window popping up.  
+- `hidapitester.exe` ... The [hidapitester](https://github.com/todbot/hidapitester) tool for Windows so you don't have to download it manually.
 
-Create the following folder **c:\Program Files\InputSwitcher** and copy the 3 files into this folder.
-Now use Logitech Options to assign a custom application to the "Menu" key and have it execute the program: **C:\Program Files\InputSwitcher\switch_to_2.vbs**.
+### Setup
 
-## 2.1 - switch_to_2.bat
-This simple batch script switches the input to channel 2.
-
-## 2.2 - switch_to_2.vbs
-This is a Visual Basic script that is just a wrapper around switch_to_2.bat. If you would execute switch_to_2.bat you would get a command prompt window that pops up every time. The switch_to_2.vbs script prevents this. So if you bind this script to a key on your keyboard you can switch to another channel without windows popping up.
+- Create the following folder `C:\Program Files\InputSwitcher` and copy the 3 files into this folder.
+- Execute `switch_to_2.bat` manually to see if it is already working out of the box. If not, refer to Section 6 of this README to see how to tweak the script for your setup.
+- Now use Logitech Options to assign a custom application to the "Menu" key and have it execute the program: `C:\Program Files\InputSwitcher\switch_to_2.vbs`.
 
 # 3 - Linux
-From the **Linux** folder, copy both files (switch_to_1.sh & hidapitester) to: **/usr/bin**
-```
-cd linux
-sudo cp hidapitester /usr/bin
-sudo cp switch_to_1.sh /usr/bin
-sudo cp 42-logitech-unify.rules /usr/lib/udev/rules.d
-chmod +x /usr/bin/hidapitester
-chmod +x /usr/bin/switch_to_1.sh
-```
-If you have Solaar installed copying the 42-logitech-unify.rules file is not needed. If you don't have Solaar installed you will probably notice that hidapitester does not work without root permissions (e.g. via sudo). This is because non-root users do not have raw access to the hid devices by default.
-So the 42-logitech-unify.rules file is a udev rule that allows raw access to the Logitech Unify receiver for non-root users. You might have to unplug your receiver and plug it in again.
+The **linux** folder contains the following files:
+- `switch_to_1.sh` ... This simple shell script switches your devices to channel 1.
+- `hidapitester` ... The [hidapitester](https://github.com/todbot/hidapitester) tool for Linux so you don't have to download it manually.
+- `42-logitech-unify.rules` ... If you have Solaar installed this file is not needed. If you don't have Solaar installed you will probably notice that hidapitester does not work without root permissions (e.g. via sudo). This is because non-root users do not have raw access to the hid devices by default. So the 42-logitech-unify.rules file is a udev rule that allows raw access to the Logitech Unify receiver for non-root users. You might have to unplug your receiver and plug it in again.
 
-Now in your desktop environment of choice, define a custom shortcut. In my case I have used the "Menu" key on my keyboard and assigned it to execute **/usr/bin/switch_to_1.sh**.
+### Setup
 
-## 3.1 - switch_to_1.sh
-This is a simple shell script for Linux to switch the input to channel 1.
+- From within the **linux** folder, copy the files to `/usr/bin`:
+  ```bash
+  cd linux
+  sudo cp hidapitester /usr/bin
+  sudo cp switch_to_1.sh /usr/bin
+  sudo cp 42-logitech-unify.rules /usr/lib/udev/rules.d
+  chmod +x /usr/bin/hidapitester
+  chmod +x /usr/bin/switch_to_1.sh
+  ```
 
-## 3.2 - 42-logitech-unify.rules
-As explained earlier, this is a udev rule to allow non-root users raw access to the Unify receiver. As in write commands to it.
+- Now also execute `switch_to_1.sh` manually to see if it is already working out of the box. If not, refer to Section 6 of this README to see how to tweak the script for your setup.
+
+- Finally, in your desktop environment of choice, define a custom shortcut. In my case I have used the "Menu" key on my keyboard and assigned it to execute **/usr/bin/switch_to_1.sh**.
 
 # 4 - Mac
-To get this working on a Mac refer to [the Mac README](mac/README.md)
+To get the Input Switcher working on a Mac refer to [the Mac README](mac/README.md)
 
 # 5 - Bind the scripts to a key
 Personally I use this key to bind the scripts to in both Windows and Linux.
@@ -68,7 +64,7 @@ You can download the awesome [Input Remapper](https://github.com/sezanzeb/input-
 1. Run the tool and click on the device (e.g., Logitech MX Keys) to land in the Presets tab.
 2. Create a new Preset, double click it and land into the editor.
 3. In the bottom left side of the window, click on the add button below "Input", press "Record" and press the button that you want to remap.
-4. In output, you can create a new Macro. Target keybard and press your combination of choice. This combination will be the one that you'll use to trigger the key binding in GNOME. I created something that I will never press: Control_L + Alt_L + Super_L + period
+4. In output, you can create a new Macro. Target keyboard and press your combination of choice. This combination will be the one that you'll use to trigger the key binding in GNOME. I created something that I will never press: Control_L + Alt_L + Super_L + period
 5. Once it has been created, give this preset a name, press the down arrow next to the rename field, and press apply.
 6. You now can go in GNOME's custom shortcut editor and specify the script you want to run.
 7. Remember to make sure that the script you created is executable and that hidapitester can as root (you have multiple choices, which have a number of security implications -- suid .sh script, sudo nopasswd for hidapitester... make an informed decision)
@@ -77,101 +73,113 @@ You can download the awesome [Input Remapper](https://github.com/sezanzeb/input-
 Now you know how to set it up, but it probably does not work yet. This is because the delivered script files are geared toward a specific setup.
 You will have to figure out what the correct command is that you have to send to your devices for them to switch.
 
-Take the command for Windows for example:  
-***.\hidapitester.exe --vidpid 046D:C52B --usage 0x0001 --usagePage 0xFF00 --open --length 7 --send-output 0x10,0x01,0x09,0x1e,0x01,0x00,0x00***
+Take the command from the Windows script `switch_to_2.bat` for example:
+```bash
+.\hidapitester.exe --vidpid 046D:C52B --usagePage 0xFF00 --usage 0x0001 --open --length 7 --send-output 0x10,0x01,0x09,0x1e,0x01,0x00,0x00
+```  
+The generic form of this command is:
+```bash
+.\hidapitester.exe --vidpid <vidpid> --usagePage <usagePage> --usage <usage> --open --length <length> --send-output <payload>
+```
 
-***--vidpid 046D:C52B***  
-This is the ID of the Logitech Unifying receiver that is plugged in to the Windows machine. Normally this ID is the same for all receivers. 
-In Linux you can easily find this by running the **lsusb** commmand in a terminal.
-In Windows you can find the ID via **Devices and Printers**. Find the Logitech Unifying Receiver and check the Hardware ID of the USB Composite Device.
-![Devices](/images/find_hardware_id.png)
+The remainder of this section will guide you through determining the correct values for all these parameters.
 
-***--usage 0x0001***  
-***--usagePage 0xFF00***  
-***--open***  
-***--length 7***  
-All these options are just defaults, you can ignore those
+## VID/PID
 
-***--send-output 0x10,0x01,0x09,0x1e,0x01,0x00,0x00***  
-This is the important part, because this command tells which device to do what.
+VID = Vendor ID, PID = Product ID. Together, they uniquely identify a human interface device (HID). Logitech's Vendor ID is 046D, so the value will always be of the form `046D:<PID>`.
 
-Let's take this command: ***0x10,0x01,0x09,0x1e,0x01,0x00,0x00***  
-And rewrite it as: ***A,B,C,D,E,F,G***
+To find out the VID/PID of connected HIDs, use `.\hidapitester.exe --list` on Windows and `.\hidapitester --list` on Linux. In the results, look for Logitech devices (VID 046D).
 
-*A = always 0x10, although Solaar seems to use 0x11.*  
-*B = This is the number of the device that is linked to the Unifying receiver: 0x01 for the first device (the keyboard), 0x02 for the second device (the mouse). 0x00 Is supposed to be the Bluetooth device, but I haven't tested that.*  
-*C = ?*  
-*D = ?*  
-*E = This is the channel to switch to: 0x00 for channel 1, 0x01 for channel 2 (and I guess 0x02 for channel 3)*  
-*F = always 0x00.*  
-*G = always 0x00.*  
+> *When using a Logitech Unifying or Bolt receiver, just use the appropriate value listed below. For bluetooth devices, use `.\hidapitester.exe --usagePage 0xFF43 --usage 0x0202 --list` to filter out most of the unwanted results. Then look for results with PID 046D.*
 
-So value of C and D are unknown... how to figure that out? Well to do that, we will use the **Solaar** application on Linux.
-Install Solaar on Linux and make sure that your keyboard and mouse are connected to channel 2, the Linux machine.
-Now open a terminal and execute the following command. This instructs Solaar to switch the device with the name "MX Keys" (the keyboard) to channel 1. So basically you command it to switch the keyboard back to Windows:
+**common values**
+- `046D:C52B` is for the Logitech Unifying receiver (Product ID C52B)
+- `046D:C548` is for the Logitech Bolt receiver (Product ID C548)
+- `046D:B034` is for connecting to the MX Master 3S via bluetooth (Product ID B034)
+- `046D:B378` is for connecting to the MX Keys S via bluetooth (Product ID B378)
 
-*solaar -ddd config "MX Keys" change-host 1*
+## UsagePage and Usage
 
-You should see your keyboard switch to channel 1 and it is connected to Windows again. At the end of the log you will see something like this:
+In the HID specification, devices organize their capabilities into Usage Pages and Usages.
 
-*logitech_receiver.base: (18) <= w[11 01 091E 00000000000000000000000000000000]*
+**common values**
+- `--usagePage 0xFF00 --usage 0x0001` for Unifying and Bolt receivers
+- `--usagePage 0xFF43 --usage 0x0202` for devices connected directly via bluetooth
 
-This is the command that was sent, by Solaar, to your keyboard to switch to channel 1.
-You can also write this as:
+## Length
 
-*11 01 09 1E 00 00 00*
+The length of the command to write to the HID in bytes. If the provided payload is shorter, it will be padded with zeros.
 
-or 
+**common values**
+- `--length 7` for short HID++ messages
+- `--length 20` for long HID++ messages
 
-*0x11 0x01 0x09 0x1E 0x00 0x00 0x00*
+> *Long HID++ messages are necessary for devices connected via bluetooth, while Unifying and Bolt receivers can deal with both, short and long messages. For simplicity, you can simply always choose a length of 20.*
 
-If you repeat this test multiple times you will see that C will never change, it stays 09. Though D will change almost every time. Sometimes it is 1E, sometimes 1B... etc. Just pick one. So finally our set of data, for the keyboard, then is:
+## Payload
 
-*A = 0x10*  
-*B = 0x01*  
-*C = 0x09*  
-*D = 0x1E*  
-*E = 0x00 to switch to Windows (channel 1), 0x01 to switch to Linux (channel 2)*  
-*F = always 0x00*  
-*G = always 0x00*  
+The payload contains the actual command that is send to the HID. Only the first 5 bytes of the command are relevant (the rest will be padded with zeros automatically):
+```bash
+--send-output <Message Type>,<Device Index>,<Feature Index>,<Function Index>,<Target Channel>
+```
 
-Now repeat this for the mouse and you will get this:
+There are several methods of finding the correct payload values for your setup. The remainder of this section will explain more about the specific payload components. Refer to Section 7 to see how to obtain the complete playload for your setup in one go.
 
-*A = 0x10*  
-*B = 0x01*  
-*C = 0x0A*  
-*D = 0x1B*  
-*E = 0x00 to switch to Windows (channel 1), 0x01 to switch to Linux (channel 2)*  
-*F = always 0x00*  
-*G = always 0x00*  
+### Message Type
 
-So C is specific to the device. In my case 09 is for the MX Keys keyboard and 0A for the MX Anywhere 3 mouse. This will probably be different in your case.
+Indicates whether command is a short or long HID++ message (similar to Length).
 
-> ⚠️ If you are having issues getting commands to work on one Windows computer that you extracted from Solaar on another computer, the device number (B) may be different on the different receivers, especially if you have reused a receiver from a different device set. Physically swap the receivers to each computer during testing to verify the numbering.
+**common values**
+- `0x10` for short HID++ messages
+- `0x11` for long HID++ messages
 
-So in conclusion this is what you have to put in your bat (on Windows) and shell script (on Linux):
+> *Long HID++ messages are necessary for devices connected via bluetooth, while Unifying and Bolt receivers can deal with both, short and long messages. For simplicity, you can simply always choose `0x11`.*
 
-**On Windows**  
-Keyboard to channel 2 : 0x10,0x01,0x09,0x1e,0x01,0x00,0x00  
-Mouse to channel 2    : 0x10,0x02,0x0a,0x1b,0x01,0x00,0x00  
+### Device Index
 
-**On Linux**  
-Keyboard to channel 1 : 0x10,0x01,0x09,0x1e,0x00,0x00,0x00  
-Mouse to channel 1    : 0x10,0x02,0x0a,0x1b,0x00,0x00,0x00  
+Index of device paired to the Unifying or Bold receiver. The index of a device is displayed in the Solaar GUI but this value can also be obtained by sniffing the traffic with Solaar or Wireshark. 
 
-If you want use bluetooch connection you need to find proper device by using:
+For devices connected directly via bluetooth, this can be any value (e.g. just use `0x00`).
 
-***.\hidapitester.exe --list-detail***
+### Feature and Function Index
 
-then you need to use 11 bytes long message (HID++)
+Identifies the HID++ feature and the specific function within the feature for the _change host_ command.
 
-***.\hidapitester.exe --vidpid 046D:B367 --usage 0x0202 --usagePage 0xff43 --open --length 11 --send-output 0x11,0x00,0x09,0x1E,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00***
+**common values**
+- `0x09,0x1E` for the MX Keys
+- `0x0A,0x1?` for the MX Anywhere 3, MX Master 3S, and the MX Keys S. Here `?` can be any value from `0` to `F`.
 
-Keyboard to channel 2: 0x11,0x00,0x09,0x1E,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00
-Mouse (MX Master 3S) to channel 2: 0x11,0x00,0x0A,0x1E,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00
+### Target Channel
 
-# 7 Find commands using Wireshark USB capture
-It is very easy to capture USB traffic via Wireshark and find commands send to the HID devices. Install [Wireshark](https://www.wireshark.org) including USBPcap and start tracing the USB Hub the dongle is connected. Filter protocol USBHID to find the SET_REPORT request changing the channel or other actions applied to the Logitech device. You can trigger commands using Logitech Options+. The data fragment is excatly the command you need for hidapitester.exe like shown in this example:
+This is the channel the device should switch to.
+
+**common values**
+- `0x00` for channel 1
+- `0x03` for channel 2
+- `0x02` for channel 3
+
+# 7 Find payload values
+
+To find the payload values for your setup, the easiest method is to sniff the commands issued when manually triggering the channel switch.
+
+## Using Solaar
+
+If you have a Linux PC with Solaar installed, use the following command to sniff the payload Solaar uses for switching the channel of your device:
+```bash
+solaar -ddd config "<device>" change-host 1
+```
+Here, `<device>` should be a substring of the device name (e.g. "MX Mas" for a "MX Master 3S").
+
+Solaar will cycle through all connected devices and find out the correct command for the requested device. The last command Solaar prints before successful completion contains the payload we want to send with the script.
+
+For example, let the last command printed by Solaar be: 
+```bash
+logitech_receiver.base: (18) <= w[11 01 091E 01000000000000000000000000000000]
+```
+Then we know that we need a Message Type of `0x11`, Device Index of `0x01`, Feature Index of `0x09`, Function Index of `0x1E`, and Target Channel of `0x01`.
+
+## Using Wireshark USB capture
+It is very easy to capture USB traffic via Wireshark and find commands send to the HID devices. Install [Wireshark](https://www.wireshark.org) including USBPcap and start tracing the USB Hub the dongle is connected. Filter protocol USBHID to find the SET_REPORT request changing the channel or other actions applied to the Logitech device. You can trigger commands using Logitech Options+. The data fragment is exactly the command you need for hidapitester.exe, as shown in this example:
 
 **Switch Logitech Craft Keyboard to Channel 3**
 
