@@ -12,6 +12,7 @@ set KB_COMMAND2=0x1E
 set KB_CHANNEL=0x00
 
 .\hidapitester.exe --vidpid 046D:%KB_PID% --usagePage %KB_USAGE_PAGE% --usage %KB_USAGE% --open --length 7 --send-output 0x10,%KB_INDEX%,%KB_COMMAND1%,%KB_COMMAND2%,%KB_CHANNEL%
+timeout /t 1 /nobreak > nul
 
 rem M750L via Bolt Receiver (C548)
 set MS_PID=C548
@@ -23,6 +24,7 @@ set MS_COMMAND2=0x1E
 set MS_CHANNEL=0x00
 
 .\hidapitester.exe --vidpid 046D:%MS_PID% --usagePage %MS_USAGE_PAGE% --usage %MS_USAGE% --open --length 7 --send-output 0x10,%MS_INDEX%,%MS_COMMAND1%,%MS_COMMAND2%,%MS_CHANNEL%
+timeout /t 1 /nobreak > nul
 
 rem M750 via Bolt Receiver (C548)
 set M2_PID=C548
