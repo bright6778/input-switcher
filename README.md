@@ -41,11 +41,11 @@ The K855 keyboard uses HID++ feature 0x1814 v1 with cookie authentication, which
    copy windows\switch_kb.ps1 "%LOCALAPPDATA%\InputSwitcher\switch_kb.ps1"
    ```
 
-3. The bat files will call this script automatically:
+3. The bat files already contain the following line to invoke the script — no manual call needed:
    ```
    powershell -ExecutionPolicy Bypass -File "%LOCALAPPDATA%\InputSwitcher\switch_kb.ps1" -TargetHost 0
    ```
-   `-TargetHost 0` = switch to PC1, `-TargetHost 1` = switch to PC2.
+   `-TargetHost 0` = switch K855 to PC1, `-TargetHost 1` = switch K855 to PC2.
 
 **How it works:** The script connects to the `logitech_kiros_agent` named pipe, enumerates registered `/change_host` routes to locate the K855 (identified by `canSetPlatform: true` and multiple BLEPRO hosts), then sends a `SET /change_host/{id}/host` command. The route is only registered when the K855 is physically connected to the current PC's Bolt receiver — if the keyboard is already on the other PC, the script exits cleanly with no error.
 
