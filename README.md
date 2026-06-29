@@ -18,9 +18,36 @@ The **windows** folder contains the following files:
 
 ### Setup
 
-- Create the following folder `C:\Program Files\InputSwitcher` and copy the 3 files into this folder.
-- Execute `switch_to_2.bat` manually to see if it is already working out of the box. If not, refer to Section 6 of this README to see how to tweak the script for your setup.
+- Create the following folder `C:\Program Files\InputSwitcher` and copy the contents of the **windows** folder into it.
+- Execute `switch_to_1.bat` or `switch_to_2.bat` manually to see if it is already working out of the box. If not, refer to Section 6 of this README to see how to tweak the script for your setup.
 - Now use Logitech Options to assign a custom application to the "Menu" key and have it execute the program: `C:\Program Files\InputSwitcher\switch_to_2.vbs`.
+
+### K855 Keyboard — Additional Setup (switch_kb.ps1)
+
+The K855 keyboard uses HID++ feature 0x1814 v1 with cookie authentication, which means direct HID++ commands (used for mice) will fail with a hardware error. Instead, the K855 is switched via the Logi Options+ internal IPC agent.
+
+**Requirements:** Logi Options+ must be installed and running on the PC.
+
+**Deployment steps (repeat on every PC that will switch the K855 away):**
+
+1. Create the directory `%LOCALAPPDATA%\InputSwitcher`  
+   (expands to `C:\Users\<username>\AppData\Local\InputSwitcher`)
+   ```
+   mkdir "%LOCALAPPDATA%\InputSwitcher"
+   ```
+
+2. Copy `switch_kb.ps1` from the **windows** folder into that directory:
+   ```
+   copy windows\switch_kb.ps1 "%LOCALAPPDATA%\InputSwitcher\switch_kb.ps1"
+   ```
+
+3. The bat files will call this script automatically:
+   ```
+   powershell -ExecutionPolicy Bypass -File "%LOCALAPPDATA%\InputSwitcher\switch_kb.ps1" -TargetHost 0
+   ```
+   `-TargetHost 0` = switch to PC1, `-TargetHost 1` = switch to PC2.
+
+**How it works:** The script connects to the `logitech_kiros_agent` named pipe, enumerates registered `/change_host` routes to locate the K855 (identified by `canSetPlatform: true` and multiple BLEPRO hosts), then sends a `SET /change_host/{id}/host` command. The route is only registered when the K855 is physically connected to the current PC's Bolt receiver — if the keyboard is already on the other PC, the script exits cleanly with no error.
 
 # 3 - Linux
 The **linux** folder contains the following files:
