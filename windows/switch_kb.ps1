@@ -1,11 +1,19 @@
 param([int]$TargetHost = 0)
 
+$log = "$env:LOCALAPPDATA\InputSwitcher\switch_kb.log"
+function Log($msg) {
+    $ts = (Get-Date).ToString("HH:mm:ss")
+    "$ts $msg" | Out-File -Append -FilePath $log -Encoding utf8
+    Write-Host $msg
+}
+
 $src = @"
 using System;
 using System.IO;
 using System.IO.Pipes;
 using System.Text;
 using System.Threading;
+using System.Collections.Generic;
 public class KirosKeyboard {
     static byte[] Frame(string msgId, string verb, string path, string payload) {
         string json = "{" + "\"msg_id\":\""+msgId+"\",\"verb\":\""+verb+"\",\"path\":\""+path+"\"" +
@@ -50,9 +58,8 @@ public class KirosKeyboard {
         } catch {}
         return null;
     }
-    // Extract all device IDs that have a /change_host/{id}/host route
-    static System.Collections.Generic.List<string> GetChangeHostIds(NamedPipeClientStream pipe, ref int mid) {
-        var ids = new System.Collections.Generic.List<string>();
+    static List<string> GetChangeHostIds(NamedPipeClientStream pipe, ref int mid) {
+        var ids = new List<string>();
         string mId = (mid++).ToString();
         byte[] frame = Frame(mId, "GET", "/routes", null);
         pipe.Write(frame,0,frame.Length); pipe.Flush();
@@ -69,53 +76,69 @@ public class KirosKeyboard {
         }
         return ids;
     }
-    public static string SwitchKeyboardHost(string pipeName, int host) {
+    // Switch ALL devices with canSetPlatform=true and multiple BLEPRO hosts.
+    // Returns list of "id:result" strings.
+    public static List<string> SwitchAllHosts(string pipeName, int host, out string debugInfo) {
+        debugInfo = "";
+        var results = new List<string>();
         var pipe=new NamedPipeClientStream(".",pipeName,PipeDirection.InOut,PipeOptions.None);
-        try { pipe.Connect(3000); } catch { return "NO_PIPE"; }
+        try { pipe.Connect(3000); } catch { results.Add("NO_PIPE"); return results; }
         ReadMsg(pipe);
         int mid = 10;
-        // Step 1: get device IDs that actually have change_host routes
         var changeHostIds = GetChangeHostIds(pipe, ref mid);
-        if (changeHostIds.Count == 0) { pipe.Close(); return "NOT_CONNECTED"; }
-        // Step 2: find K855 by checking easy_switch for canSetPlatform + multiple BLEPRO hosts
-        string keyboardId = null;
+        debugInfo += "ids: " + string.Join(",", changeHostIds.ToArray()) + "; ";
+        if (changeHostIds.Count == 0) { pipe.Close(); results.Add("NOT_CONNECTED"); return results; }
         foreach (var id in changeHostIds) {
             string mId = (mid++).ToString();
             byte[] frame = Frame(mId, "GET", "/devices/"+id+"/easy_switch", null);
             pipe.Write(frame,0,frame.Length); pipe.Flush();
             string r = ReadMsgWithId(pipe, mId) ?? "";
-            if (r.Contains("SUCCESS") && r.Contains("\"canSetPlatform\": true") &&
-                r.Split(new string[]{"\"busType\": \"BLEPRO\""}, StringSplitOptions.None).Length > 2) {
-                keyboardId = id;
-                break;
-            }
+            bool hasPlatform = r.Contains("\"canSetPlatform\": true");
+            int bleproCount = r.Split(new string[]{"\"busType\": \"BLEPRO\""}, StringSplitOptions.None).Length - 1;
+            debugInfo += id+"(canSetPlatform="+hasPlatform+",BLEPRO="+bleproCount+"); ";
+            if (!r.Contains("SUCCESS") || !hasPlatform || bleproCount <= 1) continue;
+            // This device supports host switching — switch it
+            string swId = (mid++).ToString();
+            byte[] swFrame = Frame(swId, "SET", "/change_host/"+id+"/host", "{\"host\":"+host+"}");
+            pipe.Write(swFrame,0,swFrame.Length); pipe.Flush();
+            string resp2 = ReadMsgWithId(pipe, swId) ?? "";
+            if (resp2.Contains("SUCCESS")) results.Add("OK:"+id);
+            else if (resp2.Contains("NO_SUCH_PATH")) results.Add("NOT_CONNECTED:"+id);
+            else results.Add("FAIL:"+id+":"+resp2.Substring(0, Math.Min(60, resp2.Length)));
         }
-        if (keyboardId == null) { pipe.Close(); return "NOT_FOUND"; }
-        // Step 3: send switch command
-        string swId = (mid++).ToString();
-        byte[] swFrame = Frame(swId, "SET", "/change_host/"+keyboardId+"/host", "{\"host\":"+host+"}");
-        pipe.Write(swFrame,0,swFrame.Length); pipe.Flush();
-        string resp2 = ReadMsgWithId(pipe, swId) ?? "";
         pipe.Close();
-        if (resp2.Contains("SUCCESS")) return "OK:"+keyboardId;
-        if (resp2.Contains("NO_SUCH_PATH")) return "NOT_CONNECTED";
-        return "FAIL:"+resp2.Substring(0, Math.Min(80, resp2.Length));
+        return results;
     }
 }
 "@
 
 Add-Type -TypeDefinition $src -Language CSharp -ErrorAction SilentlyContinue 2>$null
 
+Log "--- switch_kb.ps1 start, TargetHost=$TargetHost ---"
+
 $pipeName = [KirosKeyboard]::FindPipeName()
 if (-not $pipeName) {
-    Write-Host "K855: Logi Options+ agent pipe not found"
+    Log "K855: Logi Options+ agent pipe not found"
     exit 1
 }
+Log "pipe: $pipeName"
 
-$r = [KirosKeyboard]::SwitchKeyboardHost($pipeName, $TargetHost)
-switch -Wildcard ($r) {
-    "OK:*"          { Write-Host "K855: switched to host $TargetHost ($r)" }
-    "NOT_CONNECTED" { Write-Host "K855: not connected to this PC (already switched?)"; exit 0 }
-    "NOT_FOUND"     { Write-Host "K855: keyboard not found on this PC"; exit 0 }
-    default         { Write-Host "K855: FAILED ($r)"; exit 1 }
+$debug = ""
+$results = [KirosKeyboard]::SwitchAllHosts($pipeName, $TargetHost, [ref]$debug)
+Log "debug: $debug"
+
+if ($results.Count -eq 0) {
+    Log "K855: no switchable devices found (NOT_FOUND)"
+    exit 0
 }
+
+$anyOk = $false
+foreach ($r in $results) {
+    switch -Wildcard ($r) {
+        "OK:*"           { Log "switched to host $TargetHost ($r)"; $anyOk = $true }
+        "NOT_CONNECTED:*"{ Log "not connected ($r), skipped" }
+        "NO_PIPE"        { Log "Logi Options+ pipe not available"; exit 1 }
+        default          { Log "FAILED: $r" }
+    }
+}
+if (-not $anyOk) { exit 1 }
