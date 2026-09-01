@@ -49,6 +49,11 @@ The K855 keyboard uses HID++ feature 0x1814 v1 with cookie authentication, which
 
 **How it works:** The script connects to the `logitech_kiros_agent` named pipe, enumerates registered `/change_host` routes to locate the K855 (identified by `canSetPlatform: true` and multiple BLEPRO hosts), then sends a `SET /change_host/{id}/host` command. The route is only registered when the K855 is physically connected to the current PC's Bolt receiver — if the keyboard is already on the other PC, the script exits cleanly with no error.
 
+**⚠️ Known breakage: Logi Options+ auto-update (2.7.961922, 2026-09-01) blocks `switch_kb.ps1`.**
+After this update, the agent stops responding to `switch_kb.ps1` entirely (`Pipe is broken` / connection accepted but zero bytes ever come back), even though the request's on-the-wire byte format still matches exactly what the official Options+ UI sends (verified by extracting `app.asar` and diffing against captured traffic). Confirmed via a transparent proxy that relayed the *real* UI's own bytes to the *real* agent: even genuine UI traffic gets no reply once it passes through any intermediate process (ours), while the UI connecting directly to the agent works fine. This points to the update adding a same-process/identity check on the named pipe (e.g. validating the connecting process's path/signature) rather than a route or framing change — so this is not something `switch_kb.ps1` can work around without process injection into the real Options+ binary, which is out of scope here.
+- A PC that has *not* auto-updated past this version is unaffected (this is why one direction of a two-PC setup can keep working while the other breaks).
+- Until Options+ is rolled back (if your IT policy allows it) or Logitech changes this behavior, switch the K855 with its physical Easy-Switch key combo on any PC where `switch_kb.ps1` reports `NOT_FOUND`/`Pipe is broken` — mouse switching via HID++ is unaffected either way.
+
 # 3 - Linux
 The **linux** folder contains the following files:
 - `switch_to_1.sh` ... This simple shell script switches your devices to channel 1.
