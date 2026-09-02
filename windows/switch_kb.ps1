@@ -7,7 +7,11 @@ $ErrorActionPreference = "Stop"
 
 $stateDir = Join-Path $env:LOCALAPPDATA "InputSwitcher"
 $log = Join-Path $stateDir "switch_kb.log"
-New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
+$cachePath = Join-Path $stateDir "keyboard_devices.json"
+$bridgeStatePath = Join-Path $stateDir "options_bridge.json"
+if (-not (Test-Path -LiteralPath $stateDir)) {
+    New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
+}
 
 function Log($msg) {
     $ts = (Get-Date).ToString("HH:mm:ss")
@@ -15,61 +19,22 @@ function Log($msg) {
     Write-Host $msg
 }
 
-# Logi Options+ 2.7.961922 rejects direct named-pipe clients. The signed
-# Options+ UI is still trusted, so start it briefly on a random loopback-only
-# DevTools port and ask its existing preload API to send the switch request.
-$cdpSource = @"
-using System;
-using System.IO;
-using System.Net.WebSockets;
-using System.Text;
-using System.Threading;
-
-public static class InputSwitcherCdp {
-    public static string Exchange(string webSocketUrl, string request, int expectedId, int timeoutMs) {
-        using (var cts = new CancellationTokenSource())
-        using (var socket = new ClientWebSocket()) {
-            cts.CancelAfter(timeoutMs);
-            socket.ConnectAsync(new Uri(webSocketUrl), cts.Token).GetAwaiter().GetResult();
-
-            byte[] requestBytes = Encoding.UTF8.GetBytes(request);
-            socket.SendAsync(
-                new ArraySegment<byte>(requestBytes),
-                WebSocketMessageType.Text,
-                true,
-                cts.Token
-            ).GetAwaiter().GetResult();
-
-            byte[] buffer = new byte[8192];
-            string compactMarker = "\"id\":" + expectedId;
-            string spacedMarker = "\"id\": " + expectedId;
-
-            while (socket.State == WebSocketState.Open) {
-                using (var message = new MemoryStream()) {
-                    WebSocketReceiveResult received;
-                    do {
-                        received = socket.ReceiveAsync(
-                            new ArraySegment<byte>(buffer),
-                            cts.Token
-                        ).GetAwaiter().GetResult();
-
-                        if (received.MessageType == WebSocketMessageType.Close) {
-                            throw new IOException("DevTools WebSocket closed before replying");
-                        }
-                        message.Write(buffer, 0, received.Count);
-                    } while (!received.EndOfMessage);
-
-                    string text = Encoding.UTF8.GetString(message.ToArray());
-                    if (text.Contains(compactMarker) || text.Contains(spacedMarker)) {
-                        return text;
-                    }
-                }
+function Write-Utf8IfChanged($Path, $Content) {
+    if (Test-Path -LiteralPath $Path) {
+        try {
+            if ((Get-Content -LiteralPath $Path -Raw) -eq $Content) {
+                return
             }
         }
-        throw new IOException("DevTools WebSocket closed before replying");
+        catch {
+            # Replace an unreadable state file with the verified state below.
+        }
     }
+    [IO.File]::WriteAllText($Path, $Content, [Text.UTF8Encoding]::new($false))
 }
-"@
+
+# Logi Options+ 2.7.961922 rejects direct named-pipe clients. The signed UI is
+# still trusted, so keep one minimized UI process available as a fast bridge.
 
 function Get-FreeLoopbackPort {
     $listener = [System.Net.Sockets.TcpListener]::new(
@@ -85,7 +50,7 @@ function Get-FreeLoopbackPort {
     }
 }
 
-function Get-OptionsTarget($Port, [int]$TimeoutMs = 12000) {
+function Get-OptionsTarget($Port, [int]$TimeoutMs = 10000) {
     $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
     do {
         try {
@@ -100,13 +65,7 @@ function Get-OptionsTarget($Port, [int]$TimeoutMs = 12000) {
                     Select-Object -First 1
             }
             if ($target.webSocketDebuggerUrl) {
-                $version = Invoke-RestMethod `
-                    -Uri "http://127.0.0.1:$Port/json/version" `
-                    -TimeoutSec 1
-                return [pscustomobject]@{
-                    PageWebSocket = $target.webSocketDebuggerUrl
-                    BrowserWebSocket = $version.webSocketDebuggerUrl
-                }
+                return $target.webSocketDebuggerUrl
             }
         }
         catch {
@@ -125,57 +84,104 @@ function Invoke-CdpCommand($WebSocketUrl, $Method, $Parameters, [int]$TimeoutMs)
         params = $Parameters
     } | ConvertTo-Json -Depth 8 -Compress
 
-    $raw = [InputSwitcherCdp]::Exchange(
-        $WebSocketUrl,
-        $request,
-        1,
-        $TimeoutMs
-    )
-    return $raw | ConvertFrom-Json
+    $cts = [System.Threading.CancellationTokenSource]::new()
+    $socket = [System.Net.WebSockets.ClientWebSocket]::new()
+    try {
+        $cts.CancelAfter($TimeoutMs)
+        $socket.ConnectAsync(
+            [Uri]$WebSocketUrl,
+            $cts.Token
+        ).GetAwaiter().GetResult()
+
+        [byte[]]$requestBytes = [Text.Encoding]::UTF8.GetBytes($request)
+        $socket.SendAsync(
+            [ArraySegment[byte]]::new($requestBytes),
+            [System.Net.WebSockets.WebSocketMessageType]::Text,
+            $true,
+            $cts.Token
+        ).GetAwaiter().GetResult()
+
+        [byte[]]$buffer = New-Object byte[] 8192
+        while ($socket.State -eq [System.Net.WebSockets.WebSocketState]::Open) {
+            $message = [IO.MemoryStream]::new()
+            try {
+                do {
+                    $received = $socket.ReceiveAsync(
+                        [ArraySegment[byte]]::new($buffer),
+                        $cts.Token
+                    ).GetAwaiter().GetResult()
+                    if ($received.MessageType -eq `
+                        [System.Net.WebSockets.WebSocketMessageType]::Close) {
+                        throw "DevTools WebSocket closed before replying"
+                    }
+                    $message.Write($buffer, 0, $received.Count)
+                } while (-not $received.EndOfMessage)
+
+                $raw = [Text.Encoding]::UTF8.GetString($message.ToArray())
+                if ($raw -match '"id"\s*:\s*1(?:,|})') {
+                    return $raw | ConvertFrom-Json
+                }
+            }
+            finally {
+                $message.Dispose()
+            }
+        }
+        throw "DevTools WebSocket closed before replying"
+    }
+    finally {
+        $socket.Dispose()
+        $cts.Dispose()
+    }
 }
 
 $switchExpression = @'
 (async () => {
+  const started = performance.now();
   const targetHost = __TARGET_HOST__;
-  const pending = new Map();
-  let sequence = 0;
+  const cachedDevices = __CACHED_DEVICES__;
+  const initializeBridge = __INITIALIZE_BRIDGE__;
 
-  window.electronNet.onMessage(message => {
-    const id = String(message.msgId || message.msg_id || '');
-    const complete = pending.get(id);
-    if (complete) {
-      pending.delete(id);
-      complete(message);
-    }
-  });
+  // The renderer stays alive between switches. Install exactly one set of
+  // preload listeners so repeated hotkey presses do not leak callbacks.
+  if (!window.__inputSwitcherBridge) {
+    const state = {
+      pending: new Map(),
+      sequence: 0,
+      connectionState: 'unknown',
+      connectWaiters: []
+    };
+    window.electronNet.onMessage(message => {
+      const id = String(message.msgId || message.msg_id || '');
+      const complete = state.pending.get(id);
+      if (complete) {
+        state.pending.delete(id);
+        complete(message);
+      }
+    });
+    window.electronNet.onOpen(() => {
+      state.connectionState = 'open';
+      const waiters = state.connectWaiters.splice(0);
+      waiters.forEach(complete => complete());
+    });
+    window.electronNet.onError(() => {
+      state.connectionState = 'error';
+    });
+    window.electronNet.onClose(() => {
+      state.connectionState = 'closed';
+    });
+    window.__inputSwitcherBridge = state;
+  }
+  const bridge = window.__inputSwitcherBridge;
 
   const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
-
-  // Establish a fresh trusted bridge instead of guessing when the UI's own
-  // startup sequence has finished connecting to the agent.
-  await new Promise(resolve => {
-    let finished = false;
-    const complete = () => {
-      if (!finished) {
-        finished = true;
-        resolve();
-      }
-    };
-    window.electronNet.onOpen(complete);
-    window.electronNet.onError(complete);
-    window.electronNet.createConnection();
-    window.electronNet.connect();
-    setTimeout(complete, 2000);
-  });
-
-  const request = (verb, path, payload) => new Promise(resolve => {
-    const id = `input_switcher_${Date.now()}_${++sequence}`;
+  const request = (verb, path, payload, timeoutMs = 700) => new Promise(resolve => {
+    const id = `input_switcher_${Date.now()}_${++bridge.sequence}`;
     const timer = setTimeout(() => {
-      pending.delete(id);
+      bridge.pending.delete(id);
       resolve({ timeout: true, path });
-    }, 2500);
+    }, timeoutMs);
 
-    pending.set(id, response => {
+    bridge.pending.set(id, response => {
       clearTimeout(timer);
       resolve(response);
     });
@@ -185,69 +191,185 @@ $switchExpression = @'
     window.electronNet.send(JSON.stringify(message));
   });
 
-  // The page can appear just before its agent socket is ready. Retry routes.
-  let routes = null;
-  for (let attempt = 0; attempt < 4; attempt++) {
-    routes = await request('GET', '/routes');
-    if (routes && routes.result && routes.result.code === 'SUCCESS') break;
-    await delay(400);
-  }
+  const requestWithRetry = async (
+    verb,
+    path,
+    payload,
+    attempts = 2,
+    timeoutMs = 700
+  ) => {
+    let response = null;
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      response = await request(verb, path, payload, timeoutMs);
+      if (!response.timeout) return response;
+      await delay(80);
+    }
+    return response;
+  };
 
-  if (!routes || !routes.result || routes.result.code !== 'SUCCESS') {
-    return {
-      success: false,
-      status: 'IPC_FAILED',
-      detail: routes && routes.timeout ? 'routes timeout' : 'routes request failed'
+  const connectBridge = () => new Promise(resolve => {
+    if (bridge.connectionState === 'open') {
+      resolve();
+      return;
+    }
+    let finished = false;
+    let timer = null;
+    const complete = () => {
+      if (!finished) {
+        finished = true;
+        if (timer !== null) clearTimeout(timer);
+        const index = bridge.connectWaiters.indexOf(complete);
+        if (index >= 0) bridge.connectWaiters.splice(index, 1);
+        resolve();
+      }
     };
+    bridge.connectWaiters.push(complete);
+    window.electronNet.createConnection();
+    window.electronNet.connect();
+    timer = setTimeout(complete, 1500);
+  });
+
+  if (initializeBridge) {
+    // Let the renderer finish its own startup before replacing its agent
+    // connection. This cost is paid only after login/Options+ restart.
+    await delay(1200);
+    await connectBridge();
   }
 
-  const ids = [...new Set((routes.payload && routes.payload.route || [])
-    .map(route => {
-      if (route.verb !== 'GET') return null;
-      const match = /^\/change_host\/([^/]+)\/host$/.exec(route.path || '');
-      return match ? match[1] : null;
-    })
-    .filter(Boolean))];
+  const isSuccess = response => response && response.result &&
+    response.result.code === 'SUCCESS';
 
-  const candidates = await Promise.all(ids.map(async id => {
-    const [easySwitch, info] = await Promise.all([
-      request('GET', `/devices/${id}/easy_switch`),
-      request('GET', `/devices/${id}/info`)
-    ]);
-
-    const hosts = easySwitch && easySwitch.payload && easySwitch.payload.hosts || [];
-    const capabilities = easySwitch && easySwitch.payload &&
-      easySwitch.payload.capabilities || {};
+  const checkCachedDevices = async () => Promise.all(cachedDevices.map(async cached => {
+    const info = await requestWithRetry(
+      'GET',
+      `/devices/${cached.id}/info`,
+      undefined,
+      initializeBridge ? 3 : 2,
+      550
+    );
     const device = info && info.payload || {};
-    const eligible = easySwitch && easySwitch.result &&
-      easySwitch.result.code === 'SUCCESS' &&
-      info && info.result && info.result.code === 'SUCCESS' &&
-      capabilities.canSetPlatform === true &&
-      hosts.filter(host => host.paired && host.busType === 'BLEPRO').length > 1 &&
+    const reachable = Boolean(info && !info.timeout);
+    const identityMatches = isSuccess(info) &&
       device.deviceType === 'KEYBOARD' &&
-      device.connected === true;
-
+      device.modelId === cached.modelId;
     return {
-      id,
-      name: device.displayName || device.extendedDisplayName || id,
-      modelId: device.modelId || '',
-      eligible
+      id: cached.id,
+      name: device.displayName || cached.name || cached.id,
+      modelId: cached.modelId,
+      connected: identityMatches && device.connected === true,
+      reachable,
+      // Exact type/model validation makes the cache safe across agent restarts
+      // without another Windows process query on every hotkey press.
+      valid: identityMatches
     };
   }));
 
-  const keyboards = candidates.filter(candidate => candidate.eligible);
-  if (keyboards.length === 0) {
-    return { success: true, status: 'NOT_CONNECTED', candidates, switches: [] };
+  let candidates = [];
+  let source = 'cache';
+  if (cachedDevices.length > 0) {
+    candidates = await checkCachedDevices();
+    if (candidates.every(candidate => !candidate.reachable)) {
+      // Recover a bridge that was overwritten during UI startup/restart.
+      await delay(250);
+      await connectBridge();
+      candidates = await checkCachedDevices();
+    }
   }
 
-  // The receiver can acknowledge concurrent SET requests while physically
-  // applying only the first one. Send keyboard switches one at a time.
+  if (cachedDevices.length === 0 || candidates.some(candidate => !candidate.valid)) {
+    source = 'discovery';
+    let routes = await requestWithRetry(
+      'GET',
+      '/routes',
+      undefined,
+      3,
+      1600
+    );
+    if (!isSuccess(routes) && initializeBridge) {
+      await connectBridge();
+      routes = await requestWithRetry('GET', '/routes', undefined, 2, 1600);
+    }
+    if (!isSuccess(routes)) {
+      return {
+        success: false,
+        status: 'IPC_FAILED',
+        detail: 'routes request failed',
+        elapsedMs: Math.round(performance.now() - started)
+      };
+    }
+
+    const ids = [...new Set((routes.payload && routes.payload.route || [])
+      .map(route => {
+        if (route.verb !== 'GET') return null;
+        const match = /^\/change_host\/([^/]+)\/host$/.exec(route.path || '');
+        return match ? match[1] : null;
+      })
+      .filter(Boolean))];
+
+    const infos = await Promise.all(ids.map(async id => ({
+      id,
+      response: await requestWithRetry(
+        'GET',
+        `/devices/${id}/info`,
+        undefined,
+        2,
+        700
+      )
+    })));
+    const keyboards = infos.filter(item => isSuccess(item.response) &&
+      item.response.payload && item.response.payload.deviceType === 'KEYBOARD');
+
+    candidates = await Promise.all(keyboards.map(async item => {
+      const easySwitch = await requestWithRetry(
+        'GET',
+        `/devices/${item.id}/easy_switch`,
+        undefined,
+        2,
+        700
+      );
+      const device = item.response.payload || {};
+      const hosts = easySwitch && easySwitch.payload && easySwitch.payload.hosts || [];
+      const capabilities = easySwitch && easySwitch.payload &&
+        easySwitch.payload.capabilities || {};
+      const valid = isSuccess(easySwitch) &&
+        capabilities.canSetPlatform === true &&
+        hosts.filter(host => host.paired && host.busType === 'BLEPRO').length > 1;
+      return {
+        id: item.id,
+        name: device.displayName || device.extendedDisplayName || item.id,
+        modelId: device.modelId || '',
+        connected: device.connected === true,
+        valid
+      };
+    }));
+  }
+
+  const cache = candidates.filter(candidate => candidate.valid).map(candidate => ({
+    id: candidate.id,
+    name: candidate.name,
+    modelId: candidate.modelId
+  }));
+  const keyboards = candidates.filter(candidate => candidate.valid && candidate.connected);
+  if (keyboards.length === 0) {
+    return {
+      success: true,
+      status: 'NOT_CONNECTED',
+      source,
+      cache,
+      candidates,
+      switches: [],
+      elapsedMs: Math.round(performance.now() - started)
+    };
+  }
+
   const switches = [];
   for (const keyboard of keyboards) {
-    const response = await request(
+    const response = await requestWithRetry(
       'SET',
       `/change_host/${keyboard.id}/host`,
-      { host: targetHost }
+      { host: targetHost },
+      2,
+      1200
     );
     switches.push({
       id: keyboard.id,
@@ -255,31 +377,31 @@ $switchExpression = @'
       code: response && response.result && response.result.code ||
         (response && response.timeout ? 'TIMEOUT' : 'FAILED')
     });
-    await delay(250);
+    await delay(100);
   }
 
   const success = switches.every(result => result.code === 'SUCCESS');
   return {
     success,
     status: success ? 'SWITCHED' : 'SWITCH_FAILED',
+    source,
+    cache,
     candidates,
-    switches
+    switches,
+    elapsedMs: Math.round(performance.now() - started)
   };
 })()
 '@
-
-Log "--- switch_kb.ps1 start, TargetHost=$TargetHost ---"
 
 $mutex = $null
 $mutexAcquired = $false
 $launchedProcess = $null
 $launchedByUs = $false
-$targetInfo = $null
+$bridgeReady = $false
+$bridgeStateText = $null
 $exitCode = 1
 
 try {
-    Add-Type -TypeDefinition $cdpSource -Language CSharp -ErrorAction Stop
-
     $mutex = [System.Threading.Mutex]::new(
         $false,
         "Local\InputSwitcherKeyboardSwitch"
@@ -290,65 +412,136 @@ try {
     }
 
     $optionsExe = Join-Path $env:ProgramFiles "LogiOptionsPlus\logioptionsplus.exe"
-    if (-not (Test-Path -LiteralPath $optionsExe)) {
-        throw "Logi Options+ UI was not found at $optionsExe"
-    }
 
     $port = $null
-    $existingMain = @(Get-CimInstance Win32_Process `
-        -Filter "Name = 'logioptionsplus.exe'" | Where-Object {
-            $_.CommandLine -notmatch "--type="
-        }) | Select-Object -First 1
-
-    if ($existingMain) {
-        if ($existingMain.CommandLine -match "--remote-debugging-port=(\d+)") {
-            $port = [int]$Matches[1]
-            Log "using existing trusted Options+ UI (port $port)"
+    $targetInfo = $null
+    $bridgePid = $null
+    $bridgeStartTicks = $null
+    if (Test-Path -LiteralPath $bridgeStatePath) {
+        try {
+            $bridgeStateText = Get-Content -LiteralPath $bridgeStatePath -Raw
+            $bridgeState = $bridgeStateText | ConvertFrom-Json
+            $bridgeProcess = Get-Process -Id $bridgeState.pid -ErrorAction Stop
+            if ($bridgeProcess.ProcessName -eq "logioptionsplus") {
+                $bridgeStartTicks = $bridgeProcess.StartTime.ToUniversalTime().Ticks
+                if (($bridgeState.PSObject.Properties.Name -contains "startedTicks") -and
+                    [long]$bridgeState.startedTicks -ne $bridgeStartTicks) {
+                    throw "cached bridge PID was reused"
+                }
+                $port = [int]$bridgeState.port
+                if ($bridgeState.PSObject.Properties.Name -contains "targetWebSocket") {
+                    $targetInfo = [string]$bridgeState.targetWebSocket
+                }
+                if (-not $targetInfo) {
+                    $targetInfo = Get-OptionsTarget -Port $port -TimeoutMs 400
+                }
+                if ($targetInfo) {
+                    $bridgePid = $bridgeProcess.Id
+                }
+            }
         }
-        else {
+        catch {
+            $targetInfo = $null
+        }
+    }
+
+    if (-not $targetInfo) {
+        $existingMains = @(Get-CimInstance Win32_Process `
+            -Filter "Name = 'logioptionsplus.exe'" | Where-Object {
+                $_.CommandLine -notmatch "--type="
+            })
+        $existingMain = $existingMains | Where-Object {
+            $_.CommandLine -match "--remote-debugging-port=\d+"
+        } | Select-Object -First 1
+
+        if ($existingMain) {
+            if ($existingMain.CommandLine -match "--remote-debugging-port=(\d+)") {
+                $port = [int]$Matches[1]
+                $bridgePid = $existingMain.ProcessId
+                $bridgeProcess = Get-Process -Id $bridgePid -ErrorAction Stop
+                $bridgeStartTicks = $bridgeProcess.StartTime.ToUniversalTime().Ticks
+            }
+        }
+        elseif ($existingMains.Count -gt 0) {
             throw "Logi Options+ UI is already open without an automation port; close its window and retry"
         }
-    }
-    else {
-        $port = Get-FreeLoopbackPort
-        $launchedProcess = Start-Process `
-            -FilePath $optionsExe `
-            -ArgumentList @(
-                "--remote-debugging-address=127.0.0.1",
-                "--remote-debugging-port=$port",
-                "--remote-allow-origins=*"
-            ) `
-            -WindowStyle Hidden `
-            -PassThru
-        $launchedByUs = $true
-        Log "started trusted Options+ UI (pid $($launchedProcess.Id), port $port)"
-    }
+        else {
+            if (-not (Test-Path -LiteralPath $optionsExe)) {
+                throw "Logi Options+ UI was not found at $optionsExe"
+            }
+            $port = Get-FreeLoopbackPort
+            $launchedProcess = Start-Process `
+                -FilePath $optionsExe `
+                -ArgumentList @(
+                    "--remote-debugging-address=127.0.0.1",
+                    "--remote-debugging-port=$port",
+                    "--remote-allow-origins=*"
+                ) `
+                -WindowStyle Minimized `
+                -PassThru
+            $bridgePid = $launchedProcess.Id
+            $bridgeStartTicks = $launchedProcess.StartTime.ToUniversalTime().Ticks
+            $launchedByUs = $true
+            Log "started trusted Options+ UI (pid $bridgePid, port $port)"
+        }
 
-    $targetInfo = Get-OptionsTarget -Port $port
+        $targetInfo = Get-OptionsTarget -Port $port
+    }
     if (-not $targetInfo) {
         throw "Options+ automation page did not become ready"
     }
 
-    # The DevTools target is published slightly before preload and the
-    # renderer's agent bridge finish initializing.
-    Start-Sleep -Milliseconds 500
+    $cachedDevices = @()
+    if (Test-Path -LiteralPath $cachePath) {
+        try {
+            $cacheDocument = Get-Content -LiteralPath $cachePath -Raw |
+                ConvertFrom-Json
+            if ($cacheDocument.PSObject.Properties.Name -contains "devices") {
+                $cachedDevices = @($cacheDocument.devices)
+            }
+        }
+        catch {
+            Log "ignoring invalid keyboard cache"
+        }
+    }
+    $cachedJson = if ($cachedDevices.Count -gt 0) {
+        ConvertTo-Json -InputObject @($cachedDevices) -Depth 4 -Compress
+    }
+    else {
+        "[]"
+    }
 
     $expression = $switchExpression.Replace(
-        "__TARGET_HOST__",
-        [string]$TargetHost
+        "__TARGET_HOST__", [string]$TargetHost
+    ).Replace(
+        "__CACHED_DEVICES__", $cachedJson
+    ).Replace(
+        "__INITIALIZE_BRIDGE__", $(if ($launchedByUs) { "true" } else { "false" })
     )
     $result = $null
     $cdpResponse = $null
     for ($attempt = 1; $attempt -le 2 -and -not $result; $attempt++) {
-        $cdpResponse = Invoke-CdpCommand `
-            -WebSocketUrl $targetInfo.PageWebSocket `
-            -Method "Runtime.evaluate" `
-            -Parameters @{
-                expression = $expression
-                returnByValue = $true
-                awaitPromise = $true
-            } `
-            -TimeoutMs 18000
+        try {
+            $cdpResponse = Invoke-CdpCommand `
+                -WebSocketUrl $targetInfo `
+                -Method "Runtime.evaluate" `
+                -Parameters @{
+                    expression = $expression
+                    returnByValue = $true
+                    awaitPromise = $true
+                } `
+                -TimeoutMs 18000
+        }
+        catch {
+            if ($attempt -lt 2) {
+                $refreshedTarget = Get-OptionsTarget -Port $port -TimeoutMs 1200
+                if ($refreshedTarget) {
+                    $targetInfo = $refreshedTarget
+                    continue
+                }
+            }
+            throw
+        }
 
         if ($cdpResponse.result.exceptionDetails) {
             throw "Options+ page error: $($cdpResponse.result.exceptionDetails.text)"
@@ -364,21 +557,80 @@ try {
         throw "Options+ page returned no result (type=$($inner.type), description=$($inner.description))"
     }
 
-    if ($result.candidates) {
-        $candidateText = @($result.candidates | ForEach-Object {
-            "$($_.name)[$($_.id),eligible=$($_.eligible)]"
-        }) -join ", "
-        Log "candidates: $candidateText"
+    $bridgeReady = $result.status -ne "IPC_FAILED"
+    if ($bridgeReady) {
+        $newBridgeStateText = ConvertTo-Json -InputObject ([pscustomobject]@{
+            pid = $bridgePid
+            startedTicks = $bridgeStartTicks
+            port = $port
+            targetWebSocket = $targetInfo
+        }) -Compress
+        if ($bridgeStateText -ne $newBridgeStateText) {
+            Write-Utf8IfChanged -Path $bridgeStatePath -Content $newBridgeStateText
+            $bridgeStateText = $newBridgeStateText
+        }
+    }
+
+    if ($bridgeReady -and $launchedByUs) {
+        try {
+            # Minimize through the app's own preload API first so a later
+            # normal Options+ launch can restore the window correctly.
+            Invoke-CdpCommand `
+                -WebSocketUrl $targetInfo `
+                -Method "Runtime.evaluate" `
+                -Parameters @{
+                    expression = "window.electronSend.minimizeWindow(); true"
+                    returnByValue = $true
+                } `
+                -TimeoutMs 2000 | Out-Null
+            Start-Sleep -Milliseconds 250
+
+            # Remove the minimized taskbar button while preserving Electron's
+            # internal minimized state. A normal Options+ launch restores it.
+            Add-Type -Namespace InputSwitcher -Name NativeWindow `
+                -MemberDefinition @"
+[DllImport("user32.dll")]
+public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+"@
+            $launchedProcess.Refresh()
+            if ($launchedProcess.MainWindowHandle -ne 0) {
+                [InputSwitcher.NativeWindow]::ShowWindowAsync(
+                    $launchedProcess.MainWindowHandle,
+                    0
+                ) | Out-Null
+            }
+        }
+        catch {
+            # Window cosmetics must not turn a successful device switch into
+            # a failure; the bridge remains usable if minimization is blocked.
+        }
+    }
+
+    if ($result.source -eq "discovery" -and
+        ($result.PSObject.Properties.Name -contains "cache") -and
+        @($result.cache).Count -gt 0) {
+        $newCache = @($result.cache | ForEach-Object {
+            [pscustomobject]@{
+                id = $_.id
+                name = $_.name
+                modelId = $_.modelId
+            }
+        })
+        $newCacheJson = ConvertTo-Json -InputObject ([pscustomobject]@{
+            devices = $newCache
+        }) -Depth 5
+        Write-Utf8IfChanged -Path $cachePath -Content $newCacheJson
     }
 
     if ($result.status -eq "NOT_CONNECTED") {
-        Log "no connected switchable keyboard found; it may already be on the other PC"
+        Log "no connected keyboard found (mode=$($result.source), $($result.elapsedMs) ms)"
         $exitCode = 0
     }
     elseif ($result.success) {
-        foreach ($switched in @($result.switches)) {
-            Log "switched $($switched.name) to host $TargetHost ($($switched.code))"
-        }
+        $switchText = @($result.switches | ForEach-Object {
+            "$($_.name)=$($_.code)"
+        }) -join ", "
+        Log "switched host $TargetHost [$switchText] (mode=$($result.source), $($result.elapsedMs) ms)"
         $exitCode = 0
     }
     else {
@@ -390,30 +642,21 @@ catch {
     $exitCode = 1
 }
 finally {
-    if ($launchedByUs -and $targetInfo -and $targetInfo.BrowserWebSocket) {
-        try {
-            Invoke-CdpCommand `
-                -WebSocketUrl $targetInfo.BrowserWebSocket `
-                -Method "Browser.close" `
-                -Parameters @{} `
-                -TimeoutMs 2000 | Out-Null
-        }
-        catch {
-            # Browser.close commonly drops the socket before acknowledging it.
-        }
-    }
-
-    if ($launchedByUs -and $launchedProcess) {
-        try {
-            if (-not $launchedProcess.WaitForExit(3000)) {
-                Stop-Process -Id $launchedProcess.Id -Force -ErrorAction SilentlyContinue
+    if ($launchedByUs -and -not $bridgeReady -and $launchedProcess) {
+        Stop-Process -Id $launchedProcess.Id -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $bridgeStatePath) {
+            try {
+                $failedState = Get-Content -LiteralPath $bridgeStatePath -Raw |
+                    ConvertFrom-Json
+                if ([int]$failedState.pid -eq $launchedProcess.Id) {
+                    Remove-Item -LiteralPath $bridgeStatePath -Force
+                }
+            }
+            catch {
+                # A previous verified bridge state belongs to another process.
             }
         }
-        catch {
-            Stop-Process -Id $launchedProcess.Id -Force -ErrorAction SilentlyContinue
-        }
     }
-
     if ($mutexAcquired -and $mutex) {
         $mutex.ReleaseMutex()
     }
