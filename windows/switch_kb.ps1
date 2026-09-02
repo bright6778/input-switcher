@@ -470,19 +470,27 @@ try {
                 throw "Logi Options+ UI was not found at $optionsExe"
             }
             $port = Get-FreeLoopbackPort
-            $launchedProcess = Start-Process `
-                -FilePath $optionsExe `
-                -ArgumentList @(
-                    "--remote-debugging-address=127.0.0.1",
-                    "--remote-debugging-port=$port",
-                    "--remote-allow-origins=*"
-                ) `
-                -WindowStyle Minimized `
-                -PassThru
+            # Launch via WMI (not Start-Process) so the UI is parented by the
+            # WMI provider host instead of the calling console's process tree.
+            # Terminals such as Windows Terminal put everything they spawn
+            # into a Job Object that kills all descendants when the tab
+            # closes; a WMI-created process sits outside that tree entirely,
+            # so closing the console no longer takes Options+ down with it.
+            $startupInfo = New-CimInstance -ClassName Win32_ProcessStartup `
+                -ClientOnly -Property @{ ShowWindow = [uint16]7 } # SW_SHOWMINNOACTIVE
+            $commandLine = '"{0}" --remote-debugging-address=127.0.0.1 --remote-debugging-port={1} --remote-allow-origins=*' -f $optionsExe, $port
+            $createResult = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+                CommandLine = $commandLine
+                ProcessStartupInformation = $startupInfo
+            }
+            if ($createResult.ReturnValue -ne 0) {
+                throw "failed to launch Options+ UI via WMI (code $($createResult.ReturnValue))"
+            }
+            $launchedProcess = Get-Process -Id $createResult.ProcessId
             $bridgePid = $launchedProcess.Id
             $bridgeStartTicks = $launchedProcess.StartTime.ToUniversalTime().Ticks
             $launchedByUs = $true
-            Log "started trusted Options+ UI (pid $bridgePid, port $port)"
+            Log "started trusted Options+ UI via WMI (pid $bridgePid, port $port)"
         }
 
         $targetInfo = Get-OptionsTarget -Port $port
