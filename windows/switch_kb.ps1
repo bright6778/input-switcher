@@ -1,144 +1,425 @@
-param([int]$TargetHost = 0)
+param(
+    [ValidateRange(0, 2)]
+    [int]$TargetHost = 0
+)
 
-$log = "$env:LOCALAPPDATA\InputSwitcher\switch_kb.log"
+$ErrorActionPreference = "Stop"
+
+$stateDir = Join-Path $env:LOCALAPPDATA "InputSwitcher"
+$log = Join-Path $stateDir "switch_kb.log"
+New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
+
 function Log($msg) {
     $ts = (Get-Date).ToString("HH:mm:ss")
     "$ts $msg" | Out-File -Append -FilePath $log -Encoding utf8
     Write-Host $msg
 }
 
-$src = @"
+# Logi Options+ 2.7.961922 rejects direct named-pipe clients. The signed
+# Options+ UI is still trusted, so start it briefly on a random loopback-only
+# DevTools port and ask its existing preload API to send the switch request.
+$cdpSource = @"
 using System;
 using System.IO;
-using System.IO.Pipes;
+using System.Net.WebSockets;
 using System.Text;
 using System.Threading;
-using System.Collections.Generic;
-public class KirosKeyboard {
-    static byte[] Frame(string msgId, string verb, string path, string payload) {
-        string json = "{" + "\"msg_id\":\""+msgId+"\",\"verb\":\""+verb+"\",\"path\":\""+path+"\"" +
-            (string.IsNullOrEmpty(payload) ? "" : ",\"payload\":"+payload) + "}";
-        byte[] j=Encoding.UTF8.GetBytes(json); byte[] p=Encoding.UTF8.GetBytes("json");
-        int olen=p.Length+j.Length+8; byte[] f=new byte[4+4+p.Length+4+j.Length]; int pos=0;
-        f[pos++]=(byte)(olen&0xFF); f[pos++]=(byte)((olen>>8)&0xFF); f[pos++]=(byte)((olen>>16)&0xFF); f[pos++]=(byte)((olen>>24)&0xFF);
-        f[pos++]=0; f[pos++]=0; f[pos++]=0; f[pos++]=(byte)p.Length;
-        Array.Copy(p,0,f,pos,p.Length); pos+=p.Length;
-        f[pos++]=(byte)((j.Length>>24)&0xFF); f[pos++]=(byte)((j.Length>>16)&0xFF); f[pos++]=(byte)((j.Length>>8)&0xFF); f[pos++]=(byte)(j.Length&0xFF);
-        Array.Copy(j,0,f,pos,j.Length); return f;
-    }
-    static byte[] ReadFull(NamedPipeClientStream pipe, int n) {
-        byte[] buf=new byte[n]; int got=0;
-        while(got<n){byte[] tmp=new byte[n-got]; int read=0;
-            var t=new Thread(()=>{try{read=pipe.Read(tmp,0,tmp.Length);}catch{}});
-            t.Start(); t.Join(4000); if(read==0) return null;
-            Array.Copy(tmp,0,buf,got,read); got+=read;} return buf;
-    }
-    static string ReadMsg(NamedPipeClientStream pipe) {
-        var b=ReadFull(pipe,4); if(b==null) return null;
-        b=ReadFull(pipe,4); if(b==null) return null;
-        int plen=(b[0]<<24)|(b[1]<<16)|(b[2]<<8)|b[3]; b=ReadFull(pipe,plen); if(b==null) return null;
-        b=ReadFull(pipe,4); if(b==null) return null;
-        int dlen=(b[0]<<24)|(b[1]<<16)|(b[2]<<8)|b[3]; b=ReadFull(pipe,dlen); if(b==null) return null;
-        return Encoding.UTF8.GetString(b);
-    }
-    static string ReadMsgWithId(NamedPipeClientStream pipe, string expectedId) {
-        for(int attempt=0; attempt<6; attempt++) {
-            string r = ReadMsg(pipe);
-            if(r==null) return null;
-            if(r.Contains("\"msgId\": \""+expectedId+"\"")) return r;
-        }
-        return null;
-    }
-    public static string FindPipeName() {
-        try {
-            foreach(var f in Directory.GetFiles(@"\\.\pipe\")) {
-                string name = Path.GetFileName(f);
-                if(name.StartsWith("logitech_kiros_agent-")) return name;
+
+public static class InputSwitcherCdp {
+    public static string Exchange(string webSocketUrl, string request, int expectedId, int timeoutMs) {
+        using (var cts = new CancellationTokenSource())
+        using (var socket = new ClientWebSocket()) {
+            cts.CancelAfter(timeoutMs);
+            socket.ConnectAsync(new Uri(webSocketUrl), cts.Token).GetAwaiter().GetResult();
+
+            byte[] requestBytes = Encoding.UTF8.GetBytes(request);
+            socket.SendAsync(
+                new ArraySegment<byte>(requestBytes),
+                WebSocketMessageType.Text,
+                true,
+                cts.Token
+            ).GetAwaiter().GetResult();
+
+            byte[] buffer = new byte[8192];
+            string compactMarker = "\"id\":" + expectedId;
+            string spacedMarker = "\"id\": " + expectedId;
+
+            while (socket.State == WebSocketState.Open) {
+                using (var message = new MemoryStream()) {
+                    WebSocketReceiveResult received;
+                    do {
+                        received = socket.ReceiveAsync(
+                            new ArraySegment<byte>(buffer),
+                            cts.Token
+                        ).GetAwaiter().GetResult();
+
+                        if (received.MessageType == WebSocketMessageType.Close) {
+                            throw new IOException("DevTools WebSocket closed before replying");
+                        }
+                        message.Write(buffer, 0, received.Count);
+                    } while (!received.EndOfMessage);
+
+                    string text = Encoding.UTF8.GetString(message.ToArray());
+                    if (text.Contains(compactMarker) || text.Contains(spacedMarker)) {
+                        return text;
+                    }
+                }
             }
-        } catch {}
-        return null;
-    }
-    static List<string> GetChangeHostIds(NamedPipeClientStream pipe, ref int mid) {
-        var ids = new List<string>();
-        string mId = (mid++).ToString();
-        byte[] frame = Frame(mId, "GET", "/routes", null);
-        pipe.Write(frame,0,frame.Length); pipe.Flush();
-        string resp = ReadMsgWithId(pipe, mId) ?? "";
-        int cur = 0;
-        while ((cur = resp.IndexOf("/change_host/", cur)) >= 0) {
-            int s = cur + "/change_host/".Length;
-            int e = resp.IndexOf("/host", s);
-            if (e > s) {
-                string id = resp.Substring(s, e - s);
-                if (!ids.Contains(id)) ids.Add(id);
-            }
-            cur = e > 0 ? e : cur + 1;
         }
-        return ids;
-    }
-    // Switch ALL devices with canSetPlatform=true and multiple BLEPRO hosts.
-    // Returns list of "id:result" strings.
-    public static List<string> SwitchAllHosts(string pipeName, int host, out string debugInfo) {
-        debugInfo = "";
-        var results = new List<string>();
-        var pipe=new NamedPipeClientStream(".",pipeName,PipeDirection.InOut,PipeOptions.None);
-        try { pipe.Connect(3000); } catch { results.Add("NO_PIPE"); return results; }
-        ReadMsg(pipe);
-        int mid = 10;
-        var changeHostIds = GetChangeHostIds(pipe, ref mid);
-        debugInfo += "ids: " + string.Join(",", changeHostIds.ToArray()) + "; ";
-        if (changeHostIds.Count == 0) { pipe.Close(); results.Add("NOT_CONNECTED"); return results; }
-        foreach (var id in changeHostIds) {
-            string mId = (mid++).ToString();
-            byte[] frame = Frame(mId, "GET", "/devices/"+id+"/easy_switch", null);
-            pipe.Write(frame,0,frame.Length); pipe.Flush();
-            string r = ReadMsgWithId(pipe, mId) ?? "";
-            bool hasPlatform = r.Contains("\"canSetPlatform\": true");
-            int bleproCount = r.Split(new string[]{"\"busType\": \"BLEPRO\""}, StringSplitOptions.None).Length - 1;
-            debugInfo += id+"(canSetPlatform="+hasPlatform+",BLEPRO="+bleproCount+"); ";
-            if (!r.Contains("SUCCESS") || !hasPlatform || bleproCount <= 1) continue;
-            // This device supports host switching — switch it
-            string swId = (mid++).ToString();
-            byte[] swFrame = Frame(swId, "SET", "/change_host/"+id+"/host", "{\"host\":"+host+"}");
-            pipe.Write(swFrame,0,swFrame.Length); pipe.Flush();
-            string resp2 = ReadMsgWithId(pipe, swId) ?? "";
-            if (resp2.Contains("SUCCESS")) results.Add("OK:"+id);
-            else if (resp2.Contains("NO_SUCH_PATH")) results.Add("NOT_CONNECTED:"+id);
-            else results.Add("FAIL:"+id+":"+resp2.Substring(0, Math.Min(60, resp2.Length)));
-        }
-        pipe.Close();
-        return results;
+        throw new IOException("DevTools WebSocket closed before replying");
     }
 }
 "@
 
-Add-Type -TypeDefinition $src -Language CSharp -ErrorAction SilentlyContinue 2>$null
+function Get-FreeLoopbackPort {
+    $listener = [System.Net.Sockets.TcpListener]::new(
+        [System.Net.IPAddress]::Loopback,
+        0
+    )
+    try {
+        $listener.Start()
+        return ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
+    }
+    finally {
+        $listener.Stop()
+    }
+}
+
+function Get-OptionsTarget($Port, [int]$TimeoutMs = 12000) {
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+    do {
+        try {
+            $targets = @(Invoke-RestMethod `
+                -Uri "http://127.0.0.1:$Port/json/list" `
+                -TimeoutSec 1)
+            $target = $targets | Where-Object {
+                $_.type -eq "page" -and $_.url -match "LogiOptionsPlus.+index\.html"
+            } | Select-Object -First 1
+            if (-not $target) {
+                $target = $targets | Where-Object { $_.type -eq "page" } |
+                    Select-Object -First 1
+            }
+            if ($target.webSocketDebuggerUrl) {
+                $version = Invoke-RestMethod `
+                    -Uri "http://127.0.0.1:$Port/json/version" `
+                    -TimeoutSec 1
+                return [pscustomobject]@{
+                    PageWebSocket = $target.webSocketDebuggerUrl
+                    BrowserWebSocket = $version.webSocketDebuggerUrl
+                }
+            }
+        }
+        catch {
+            # The UI is still starting. Retry until the short deadline.
+        }
+        Start-Sleep -Milliseconds 200
+    } while ([DateTime]::UtcNow -lt $deadline)
+
+    return $null
+}
+
+function Invoke-CdpCommand($WebSocketUrl, $Method, $Parameters, [int]$TimeoutMs) {
+    $request = @{
+        id = 1
+        method = $Method
+        params = $Parameters
+    } | ConvertTo-Json -Depth 8 -Compress
+
+    $raw = [InputSwitcherCdp]::Exchange(
+        $WebSocketUrl,
+        $request,
+        1,
+        $TimeoutMs
+    )
+    return $raw | ConvertFrom-Json
+}
+
+$switchExpression = @'
+(async () => {
+  const targetHost = __TARGET_HOST__;
+  const pending = new Map();
+  let sequence = 0;
+
+  window.electronNet.onMessage(message => {
+    const id = String(message.msgId || message.msg_id || '');
+    const complete = pending.get(id);
+    if (complete) {
+      pending.delete(id);
+      complete(message);
+    }
+  });
+
+  const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+  // Establish a fresh trusted bridge instead of guessing when the UI's own
+  // startup sequence has finished connecting to the agent.
+  await new Promise(resolve => {
+    let finished = false;
+    const complete = () => {
+      if (!finished) {
+        finished = true;
+        resolve();
+      }
+    };
+    window.electronNet.onOpen(complete);
+    window.electronNet.onError(complete);
+    window.electronNet.createConnection();
+    window.electronNet.connect();
+    setTimeout(complete, 2000);
+  });
+
+  const request = (verb, path, payload) => new Promise(resolve => {
+    const id = `input_switcher_${Date.now()}_${++sequence}`;
+    const timer = setTimeout(() => {
+      pending.delete(id);
+      resolve({ timeout: true, path });
+    }, 2500);
+
+    pending.set(id, response => {
+      clearTimeout(timer);
+      resolve(response);
+    });
+
+    const message = { msg_id: id, verb, path };
+    if (payload !== undefined) message.payload = payload;
+    window.electronNet.send(JSON.stringify(message));
+  });
+
+  // The page can appear just before its agent socket is ready. Retry routes.
+  let routes = null;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    routes = await request('GET', '/routes');
+    if (routes && routes.result && routes.result.code === 'SUCCESS') break;
+    await delay(400);
+  }
+
+  if (!routes || !routes.result || routes.result.code !== 'SUCCESS') {
+    return {
+      success: false,
+      status: 'IPC_FAILED',
+      detail: routes && routes.timeout ? 'routes timeout' : 'routes request failed'
+    };
+  }
+
+  const ids = [...new Set((routes.payload && routes.payload.route || [])
+    .map(route => {
+      if (route.verb !== 'GET') return null;
+      const match = /^\/change_host\/([^/]+)\/host$/.exec(route.path || '');
+      return match ? match[1] : null;
+    })
+    .filter(Boolean))];
+
+  const candidates = await Promise.all(ids.map(async id => {
+    const [easySwitch, info] = await Promise.all([
+      request('GET', `/devices/${id}/easy_switch`),
+      request('GET', `/devices/${id}/info`)
+    ]);
+
+    const hosts = easySwitch && easySwitch.payload && easySwitch.payload.hosts || [];
+    const capabilities = easySwitch && easySwitch.payload &&
+      easySwitch.payload.capabilities || {};
+    const device = info && info.payload || {};
+    const eligible = easySwitch && easySwitch.result &&
+      easySwitch.result.code === 'SUCCESS' &&
+      info && info.result && info.result.code === 'SUCCESS' &&
+      capabilities.canSetPlatform === true &&
+      hosts.filter(host => host.paired && host.busType === 'BLEPRO').length > 1 &&
+      device.deviceType === 'KEYBOARD' &&
+      device.connected === true;
+
+    return {
+      id,
+      name: device.displayName || device.extendedDisplayName || id,
+      modelId: device.modelId || '',
+      eligible
+    };
+  }));
+
+  const keyboards = candidates.filter(candidate => candidate.eligible);
+  if (keyboards.length === 0) {
+    return { success: true, status: 'NOT_CONNECTED', candidates, switches: [] };
+  }
+
+  // The receiver can acknowledge concurrent SET requests while physically
+  // applying only the first one. Send keyboard switches one at a time.
+  const switches = [];
+  for (const keyboard of keyboards) {
+    const response = await request(
+      'SET',
+      `/change_host/${keyboard.id}/host`,
+      { host: targetHost }
+    );
+    switches.push({
+      id: keyboard.id,
+      name: keyboard.name,
+      code: response && response.result && response.result.code ||
+        (response && response.timeout ? 'TIMEOUT' : 'FAILED')
+    });
+    await delay(250);
+  }
+
+  const success = switches.every(result => result.code === 'SUCCESS');
+  return {
+    success,
+    status: success ? 'SWITCHED' : 'SWITCH_FAILED',
+    candidates,
+    switches
+  };
+})()
+'@
 
 Log "--- switch_kb.ps1 start, TargetHost=$TargetHost ---"
 
-$pipeName = [KirosKeyboard]::FindPipeName()
-if (-not $pipeName) {
-    Log "K855: Logi Options+ agent pipe not found"
-    exit 1
-}
-Log "pipe: $pipeName"
+$mutex = $null
+$mutexAcquired = $false
+$launchedProcess = $null
+$launchedByUs = $false
+$targetInfo = $null
+$exitCode = 1
 
-$debug = ""
-$results = [KirosKeyboard]::SwitchAllHosts($pipeName, $TargetHost, [ref]$debug)
-Log "debug: $debug"
+try {
+    Add-Type -TypeDefinition $cdpSource -Language CSharp -ErrorAction Stop
 
-if ($results.Count -eq 0) {
-    Log "K855: no switchable devices found (NOT_FOUND)"
-    exit 0
-}
+    $mutex = [System.Threading.Mutex]::new(
+        $false,
+        "Local\InputSwitcherKeyboardSwitch"
+    )
+    $mutexAcquired = $mutex.WaitOne(15000)
+    if (-not $mutexAcquired) {
+        throw "another keyboard switch is still running"
+    }
 
-$anyOk = $false
-foreach ($r in $results) {
-    switch -Wildcard ($r) {
-        "OK:*"           { Log "switched to host $TargetHost ($r)"; $anyOk = $true }
-        "NOT_CONNECTED:*"{ Log "not connected ($r), skipped" }
-        "NO_PIPE"        { Log "Logi Options+ pipe not available"; exit 1 }
-        default          { Log "FAILED: $r" }
+    $optionsExe = Join-Path $env:ProgramFiles "LogiOptionsPlus\logioptionsplus.exe"
+    if (-not (Test-Path -LiteralPath $optionsExe)) {
+        throw "Logi Options+ UI was not found at $optionsExe"
+    }
+
+    $port = $null
+    $existingMain = @(Get-CimInstance Win32_Process `
+        -Filter "Name = 'logioptionsplus.exe'" | Where-Object {
+            $_.CommandLine -notmatch "--type="
+        }) | Select-Object -First 1
+
+    if ($existingMain) {
+        if ($existingMain.CommandLine -match "--remote-debugging-port=(\d+)") {
+            $port = [int]$Matches[1]
+            Log "using existing trusted Options+ UI (port $port)"
+        }
+        else {
+            throw "Logi Options+ UI is already open without an automation port; close its window and retry"
+        }
+    }
+    else {
+        $port = Get-FreeLoopbackPort
+        $launchedProcess = Start-Process `
+            -FilePath $optionsExe `
+            -ArgumentList @(
+                "--remote-debugging-address=127.0.0.1",
+                "--remote-debugging-port=$port",
+                "--remote-allow-origins=*"
+            ) `
+            -WindowStyle Hidden `
+            -PassThru
+        $launchedByUs = $true
+        Log "started trusted Options+ UI (pid $($launchedProcess.Id), port $port)"
+    }
+
+    $targetInfo = Get-OptionsTarget -Port $port
+    if (-not $targetInfo) {
+        throw "Options+ automation page did not become ready"
+    }
+
+    # The DevTools target is published slightly before preload and the
+    # renderer's agent bridge finish initializing.
+    Start-Sleep -Milliseconds 500
+
+    $expression = $switchExpression.Replace(
+        "__TARGET_HOST__",
+        [string]$TargetHost
+    )
+    $result = $null
+    $cdpResponse = $null
+    for ($attempt = 1; $attempt -le 2 -and -not $result; $attempt++) {
+        $cdpResponse = Invoke-CdpCommand `
+            -WebSocketUrl $targetInfo.PageWebSocket `
+            -Method "Runtime.evaluate" `
+            -Parameters @{
+                expression = $expression
+                returnByValue = $true
+                awaitPromise = $true
+            } `
+            -TimeoutMs 18000
+
+        if ($cdpResponse.result.exceptionDetails) {
+            throw "Options+ page error: $($cdpResponse.result.exceptionDetails.text)"
+        }
+        $result = $cdpResponse.result.result.value
+        if (-not $result -and $attempt -lt 2) {
+            Start-Sleep -Milliseconds 500
+        }
+    }
+
+    if (-not $result) {
+        $inner = $cdpResponse.result.result
+        throw "Options+ page returned no result (type=$($inner.type), description=$($inner.description))"
+    }
+
+    if ($result.candidates) {
+        $candidateText = @($result.candidates | ForEach-Object {
+            "$($_.name)[$($_.id),eligible=$($_.eligible)]"
+        }) -join ", "
+        Log "candidates: $candidateText"
+    }
+
+    if ($result.status -eq "NOT_CONNECTED") {
+        Log "no connected switchable keyboard found; it may already be on the other PC"
+        $exitCode = 0
+    }
+    elseif ($result.success) {
+        foreach ($switched in @($result.switches)) {
+            Log "switched $($switched.name) to host $TargetHost ($($switched.code))"
+        }
+        $exitCode = 0
+    }
+    else {
+        throw "keyboard switch failed: $($result.status) $($result.detail)"
     }
 }
-if (-not $anyOk) { exit 1 }
+catch {
+    Log "FAILED: $($_.Exception.Message)"
+    $exitCode = 1
+}
+finally {
+    if ($launchedByUs -and $targetInfo -and $targetInfo.BrowserWebSocket) {
+        try {
+            Invoke-CdpCommand `
+                -WebSocketUrl $targetInfo.BrowserWebSocket `
+                -Method "Browser.close" `
+                -Parameters @{} `
+                -TimeoutMs 2000 | Out-Null
+        }
+        catch {
+            # Browser.close commonly drops the socket before acknowledging it.
+        }
+    }
+
+    if ($launchedByUs -and $launchedProcess) {
+        try {
+            if (-not $launchedProcess.WaitForExit(3000)) {
+                Stop-Process -Id $launchedProcess.Id -Force -ErrorAction SilentlyContinue
+            }
+        }
+        catch {
+            Stop-Process -Id $launchedProcess.Id -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    if ($mutexAcquired -and $mutex) {
+        $mutex.ReleaseMutex()
+    }
+    if ($mutex) {
+        $mutex.Dispose()
+    }
+}
+
+exit $exitCode
