@@ -207,6 +207,44 @@ $switchExpression = @'
     return response;
   };
 
+  // BLE keyboards on a Bolt receiver (e.g. POP Icon Keys) can report
+  // connected=false to Options+ right after they wake from an idle/sleep
+  // state, even though they are physically on and paired. A single
+  // snapshot at query time is unreliable, so give devices that are
+  // otherwise valid (easy-switch capable) a few more short polls to show
+  // up as connected before giving up on them. This costs nothing when
+  // every device is already connected (loop exits immediately).
+  const waitForConnected = async (ids, attempts = 5, delayMs = 350) => {
+    const connected = new Map(ids.map(id => [id, false]));
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      if (![...connected.values()].some(value => !value)) break;
+      if (attempt > 0) await delay(delayMs);
+      await Promise.all(ids.filter(id => !connected.get(id)).map(async id => {
+        const info = await requestWithRetry('GET', `/devices/${id}/info`, undefined, 1, 500);
+        if (isSuccess(info) && info.payload && info.payload.connected === true) {
+          connected.set(id, true);
+        }
+      }));
+    }
+    return connected;
+  };
+
+  // Same BLE-wake issue as waitForConnected, but for a single query whose
+  // *content* (not just a connected flag) only comes back correct once the
+  // device is awake enough to answer Options+ in full — device identity
+  // during discovery, and easy-switch capabilities/host list. Keeps polling
+  // until `predicate` accepts a response, otherwise returns the last
+  // (possibly still-incomplete) response so callers can fail gracefully.
+  const pollUntil = async (fn, predicate, attempts = 5, delayMs = 350) => {
+    let result = null;
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      if (attempt > 0) await delay(delayMs);
+      result = await fn();
+      if (predicate(result)) return result;
+    }
+    return result;
+  };
+
   const connectBridge = () => new Promise(resolve => {
     if (bridge.connectionState === 'open') {
       resolve();
@@ -306,26 +344,41 @@ $switchExpression = @'
       })
       .filter(Boolean))];
 
-    const infos = await Promise.all(ids.map(async id => ({
-      id,
-      response: await requestWithRetry(
-        'GET',
-        `/devices/${id}/info`,
-        undefined,
-        2,
-        700
-      )
-    })));
+    // A Bolt-receiver keyboard that is idle/asleep (POP Icon Keys does this
+    // aggressively) can answer /info with connected:false, or /easy_switch
+    // with an empty/incomplete host list, on the first poll right after the
+    // UI starts. Retry each device a few times before writing it off, so a
+    // sleepy keyboard still makes it into the cache instead of being
+    // silently dropped from every future switch.
+    //
+    // Devices are polled one at a time (not Promise.all) because both K855
+    // and POP share a single Bolt receiver: firing concurrent HID++ queries
+    // at two devices behind the same receiver let one device answer cleanly
+    // while starving the other, which looked like "only one keyboard is
+    // ever valid" and made the cache flip-flop between them.
+    const infos = [];
+    for (const id of ids) {
+      const response = await pollUntil(
+        () => requestWithRetry('GET', `/devices/${id}/info`, undefined, 2, 700),
+        r => isSuccess(r) && r.payload && r.payload.connected === true,
+        5,
+        350
+      );
+      infos.push({ id, response });
+    }
     const keyboards = infos.filter(item => isSuccess(item.response) &&
       item.response.payload && item.response.payload.deviceType === 'KEYBOARD');
 
-    candidates = await Promise.all(keyboards.map(async item => {
-      const easySwitch = await requestWithRetry(
-        'GET',
-        `/devices/${item.id}/easy_switch`,
-        undefined,
-        2,
-        700
+    candidates = [];
+    for (const item of keyboards) {
+      const easySwitch = await pollUntil(
+        () => requestWithRetry('GET', `/devices/${item.id}/easy_switch`, undefined, 2, 700),
+        r => isSuccess(r) && r.payload && r.payload.capabilities &&
+          r.payload.capabilities.canSetPlatform === true &&
+          (r.payload.hosts || []).filter(host =>
+            host.paired && host.busType === 'BLEPRO').length > 1,
+        5,
+        350
       );
       const device = item.response.payload || {};
       const hosts = easySwitch && easySwitch.payload && easySwitch.payload.hosts || [];
@@ -334,14 +387,26 @@ $switchExpression = @'
       const valid = isSuccess(easySwitch) &&
         capabilities.canSetPlatform === true &&
         hosts.filter(host => host.paired && host.busType === 'BLEPRO').length > 1;
-      return {
+      candidates.push({
         id: item.id,
         name: device.displayName || device.extendedDisplayName || item.id,
         modelId: device.modelId || '',
         connected: device.connected === true,
         valid
-      };
-    }));
+      });
+    }
+  }
+
+  const pendingIds = candidates
+    .filter(candidate => candidate.valid && !candidate.connected)
+    .map(candidate => candidate.id);
+  if (pendingIds.length > 0) {
+    const nowConnected = await waitForConnected(pendingIds);
+    candidates = candidates.map(candidate => (
+      nowConnected.get(candidate.id)
+        ? { ...candidate, connected: true }
+        : candidate
+    ));
   }
 
   const cache = candidates.filter(candidate => candidate.valid).map(candidate => ({
@@ -617,13 +682,34 @@ public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
     if ($result.source -eq "discovery" -and
         ($result.PSObject.Properties.Name -contains "cache") -and
         @($result.cache).Count -gt 0) {
-        $newCache = @($result.cache | ForEach-Object {
-            [pscustomobject]@{
-                id = $_.id
-                name = $_.name
-                modelId = $_.modelId
+        # Merge with the previous cache instead of replacing it outright.
+        # A single discovery pass only reconfirms whichever devices
+        # answered in time; on a shared Bolt receiver, two easy-switch
+        # keyboards queried back-to-back can crowd each other out so only
+        # one validates on a given pass. Overwriting the cache with just
+        # that pass's results would drop the other keyboard from every
+        # future switch. Keep previously known-good entries unless this
+        # pass explicitly saw that id and it is no longer a keyboard
+        # (candidates lists every device this pass looked at, valid or not).
+        $seenIds = @($result.candidates | ForEach-Object { $_.id })
+        $mergedById = [ordered]@{}
+        foreach ($old in $cachedDevices) {
+            if ($seenIds -notcontains $old.id) {
+                $mergedById[$old.id] = [pscustomobject]@{
+                    id = $old.id
+                    name = $old.name
+                    modelId = $old.modelId
+                }
             }
-        })
+        }
+        foreach ($fresh in $result.cache) {
+            $mergedById[$fresh.id] = [pscustomobject]@{
+                id = $fresh.id
+                name = $fresh.name
+                modelId = $fresh.modelId
+            }
+        }
+        $newCache = @($mergedById.Values)
         $newCacheJson = ConvertTo-Json -InputObject ([pscustomobject]@{
             devices = $newCache
         }) -Depth 5
